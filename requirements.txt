@@ -1,5 +1,6 @@
 streamlit
-requests
+httpx[http2]
+httpx[brotli]
 beautifulsoup4
 lxml
 pandas
