@@ -1,172 +1,213 @@
 import streamlit as st
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 import time
 import random
-import re
 
 st.set_page_config(page_title="Auchan Scraper", layout="wide")
 
-# ---------------------------------------------------------------------------
-# Stealth session
-# ---------------------------------------------------------------------------
+try:
+    import httpx
+    USE_HTTPX = True
+except ImportError:
+    import requests
+    USE_HTTPX = False
 
-def make_session() -> requests.Session:
-    """Return a session that looks like a real browser."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://zakupy.auchan.pl/",
-        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "same-origin",
-        "sec-fetch-user": "?1",
-        "upgrade-insecure-requests": "1",
-        "Connection": "keep-alive",
-    })
-    return session
-
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# Scraping helpers
+# Headers — no Accept-Encoding so the library handles decompression itself
 # ---------------------------------------------------------------------------
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://zakupy.auchan.pl/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "Connection": "keep-alive",
+}
 
-def fetch_page(session: requests.Session, url: str, label: str = "") -> BeautifulSoup | None:
-    """Fetch a URL and return a BeautifulSoup object, or None on failure."""
+
+def make_client():
+    if USE_HTTPX:
+        return httpx.Client(headers=HEADERS, follow_redirects=True, timeout=25, http2=True)
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def fetch(client, url: str):
+    """Returns (status_code, decoded_text, raw_bytes)."""
     try:
-        resp = session.get(url, timeout=20, allow_redirects=True)
-        if resp.status_code != 200:
-            st.warning(f"HTTP {resp.status_code} for {label or url}")
-            return None
-        return BeautifulSoup(resp.text, "html.parser")
+        r = client.get(url)
+        return r.status_code, r.text, r.content
     except Exception as exc:
-        st.warning(f"Request failed for {label or url}: {exc}")
-        return None
+        return 0, str(exc), b""
 
 
-def find_product_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """
-    Try multiple CSS selectors that Auchan PL has used historically.
-    Returns a deduplicated list of absolute product URLs.
-    """
-    selectors = [
-        "a[href*='/product/']",          # older product path
-        "a[href*='/p/']",                # shortened path variant
-        "a.product-tile__name",          # named class variant
-        "a[data-testid='product-name']", # test-id variant
-        "a.product-card__link",          # card link variant
-    ]
+# ---------------------------------------------------------------------------
+# Detection helpers
+# ---------------------------------------------------------------------------
+
+def is_binary(text: str) -> bool:
+    if not text:
+        return False
+    sample = text[:500]
+    bad = sum(1 for c in sample if ord(c) > 127 or ord(c) < 9)
+    return bad / len(sample) > 0.10
+
+
+def is_blocked(html: str) -> bool:
+    lower = html.lower()
+    return any(s in lower for s in [
+        "just a moment", "enable javascript", "checking your browser",
+        "cf-browser-verification", "ray id", "perimeterx", "px-captcha",
+        "human verification", "access denied", "_cf_chl",
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Link discovery & detail extraction
+# ---------------------------------------------------------------------------
+
+def find_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+    from urllib.parse import urlparse
+    base = "{0.scheme}://{0.netloc}".format(urlparse(base_url))
     found: set[str] = set()
-    for sel in selectors:
+    for sel in ["a[href*='/product/']", "a[href*='/p/']",
+                "a.product-tile__name", "a[data-testid='product-name']",
+                "a.product-card__link"]:
         for tag in soup.select(sel):
             href = tag.get("href", "")
-            if href:
-                if href.startswith("http"):
-                    found.add(href)
-                elif href.startswith("/"):
-                    # Build absolute URL from the base
-                    from urllib.parse import urlparse
-                    parsed = urlparse(base_url)
-                    found.add(f"{parsed.scheme}://{parsed.netloc}{href}")
-    return list(found)
+            if href.startswith("http"):
+                found.add(href)
+            elif href.startswith("/"):
+                found.add(base + href)
+    skip = {"/cart", "/login", "/account", "/search", "/categories"}
+    return [u for u in found if not any(s in u for s in skip)]
 
 
-def extract_product_details(soup: BeautifulSoup, url: str) -> dict:
-    """Best-effort extraction of name, brand, price from a product page."""
-    def try_select_text(*selectors) -> str:
-        for sel in selectors:
-            el = soup.select_one(sel)
+def extract(soup: BeautifulSoup, url: str) -> dict:
+    def t(*sels):
+        for s in sels:
+            el = soup.select_one(s)
             if el and el.get_text(strip=True):
                 return el.get_text(strip=True)
         return "N/A"
-
-    name = try_select_text(
-        "h1",
-        "[data-testid='product-name']",
-        ".product-name",
-        ".product-title",
-    )
-    brand = try_select_text(
-        "span[itemprop='brand']",
-        "[data-testid='product-brand']",
-        ".product-brand",
-        ".brand-name",
-    )
-    price = try_select_text(
-        "[data-testid='product-price']",
-        ".product-price",
-        ".price",
-        "span[itemprop='price']",
-        ".price-new",
-    )
-
-    return {"Product Name": name, "Brand": brand, "Price": price, "Link": url}
+    return {
+        "Product Name": t("h1", "[data-testid='product-name']", ".product-name"),
+        "Brand":        t("span[itemprop='brand']", "[data-testid='product-brand']", ".product-brand"),
+        "Price":        t("[data-testid='product-price']", ".product-price", ".price", "span[itemprop='price']"),
+        "Link": url,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Main scraping workflow
+# Diagnosis panel
 # ---------------------------------------------------------------------------
 
-def scrape_auchan(category_url: str, num_products: int) -> pd.DataFrame:
-    session = make_session()
+def show_diagnosis(html: str, raw: bytes, status: int):
+    with st.expander("🔬 Diagnosis — click to expand"):
+        if is_binary(html):
+            st.error(
+                f"**Binary/garbled response (HTTP {status}).**\n\n"
+                "The server returned compressed data that couldn't be decoded, "
+                "OR a Cloudflare JS challenge page. "
+                "The hex dump below confirms this."
+            )
+        elif is_blocked(html):
+            st.warning("**Bot-detection page detected** (Cloudflare / PerimeterX challenge).")
+        else:
+            st.info("Response looks like HTML but no product links were found — "
+                    "the page structure may have changed.")
+
+        st.markdown("""
+### Root cause
+
+Auchan PL is protected by **Cloudflare with JS challenges**.  
+A plain HTTP client cannot execute JavaScript, so Cloudflare serves a challenge instead of real content.
+
+### Fix options
+
+| Solution | Effort | Cost |
+|---|---|---|
+| **Run locally** — your home IP is not flagged | ⭐ Easy | Free |
+| **ScraperAPI / ZenRows / Bright Data** — managed proxy that solves JS challenges | ⭐⭐ Medium | ~$50/mo |
+| **Playwright + stealth** on a VPS + residential proxy | ⭐⭐⭐ Hard | ~$20/mo |
+| **Reverse the XHR API** — open DevTools → Network → Fetch/XHR on Auchan, find the JSON product endpoint, call it directly | ⭐⭐ Medium | Free |
+
+The XHR API route is the most reliable long-term: modern SPAs like Auchan load product data via internal JSON APIs that are much simpler to call than scraping rendered HTML.
+        """)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**HTML preview (first 1 000 chars):**")
+            st.code(html[:1000] or "(empty)", language="html")
+        with c2:
+            st.markdown("**Hex dump (first 80 bytes):**")
+            st.code(raw[:80].hex() if raw else "(empty)")
+
+
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
+def scrape(category_url: str, num_products: int) -> pd.DataFrame:
+    client = make_client()
     results = []
 
-    # --- 1. Warm up: hit the homepage first (builds cookies, looks natural) ---
-    st.info("🌐 Warming up session on Auchan homepage…")
-    home_soup = fetch_page(session, "https://zakupy.auchan.pl/", "homepage")
-    if home_soup is None:
-        st.error("Cannot reach Auchan.pl at all — the site may be blocking this IP outright.")
+    # Warm-up
+    st.info("🌐 Visiting homepage to collect cookies…")
+    sc, html, raw = fetch(client, "https://zakupy.auchan.pl/")
+    if is_binary(html) or is_blocked(html):
+        st.error("🚫 Blocked at homepage.")
+        show_diagnosis(html, raw, sc)
         return pd.DataFrame()
+    st.success(f"Homepage OK — HTTP {sc}, {len(html):,} chars")
     time.sleep(random.uniform(2, 4))
 
-    # --- 2. Fetch category page ---
-    st.info(f"📂 Loading category page…")
-    cat_soup = fetch_page(session, category_url, "category page")
-    if cat_soup is None:
-        st.error("Category page fetch failed.")
+    # Category page
+    st.info("📂 Loading category page…")
+    sc, html, raw = fetch(client, category_url)
+    if is_binary(html) or is_blocked(html):
+        st.error("🚫 Blocked at category page.")
+        show_diagnosis(html, raw, sc)
         return pd.DataFrame()
 
-    # --- 3. Find product links ---
-    links = find_product_links(cat_soup, category_url)[:num_products]
+    soup = BeautifulSoup(html, "lxml")
+    links = find_links(soup, category_url)[:num_products]
 
     if not links:
-        st.error(
-            "No product links found on the category page.\n\n"
-            "This usually means one of:\n"
-            "- Bot detection blocked the request (Cloudflare / PerimeterX)\n"
-            "- The page renders via JavaScript (links are injected after load)\n"
-            "- The CSS selectors need updating for the current site structure\n\n"
-            "See the **Debug** section below for the raw HTML snippet."
-        )
-        with st.expander("🔍 Debug: raw page HTML (first 3000 chars)"):
-            st.code(str(cat_soup)[:3000], language="html")
+        st.error("No product links found.")
+        show_diagnosis(html, raw, sc)
         return pd.DataFrame()
 
-    st.success(f"Found {len(links)} product links.")
+    st.success(f"✅ {len(links)} product link(s) found.")
 
-    # --- 4. Scrape each product page ---
-    progress = st.progress(0)
+    # Product pages
+    bar = st.progress(0)
     for i, url in enumerate(links):
-        st.write(f"🔍 [{i+1}/{len(links)}] {url.split('/')[-1][:60]}")
-        prod_soup = fetch_page(session, url, f"product {i+1}")
-        if prod_soup:
-            results.append(extract_product_details(prod_soup, url))
-        progress.progress((i + 1) / len(links))
-        time.sleep(random.uniform(2, 5))   # polite crawl delay
+        st.write(f"🔍 [{i+1}/{len(links)}] {url.split('/')[-1][:70]}")
+        sc2, h2, _ = fetch(client, url)
+        if not is_binary(h2) and not is_blocked(h2):
+            results.append(extract(BeautifulSoup(h2, "lxml"), url))
+        else:
+            results.append({"Product Name": "BLOCKED", "Brand": "N/A", "Price": "N/A", "Link": url})
+        bar.progress((i + 1) / len(links))
+        time.sleep(random.uniform(2, 5))
 
     return pd.DataFrame(results)
 
@@ -177,14 +218,6 @@ def scrape_auchan(category_url: str, num_products: int) -> pd.DataFrame:
 
 st.title("🛒 Auchan PL — Data Vacuum")
 
-st.info(
-    "⚠️ **Note:** Auchan's product pages are heavily JavaScript-rendered. "
-    "If product details show as *N/A*, the page content is injected by JS after load — "
-    "in that case only a full browser (Selenium) can extract it, but that approach "
-    "is reliably blocked on shared cloud IPs. "
-    "Running locally or with a residential proxy gives much better results."
-)
-
 url_input = st.text_input(
     "Auchan Category URL",
     "https://zakupy.auchan.pl/categories/higiena-i-kosmetyki/piel%C4%99gnacja-w%C5%82os%C3%B3w/3939",
@@ -192,7 +225,7 @@ url_input = st.text_input(
 count = st.slider("Max products to scrape", 1, 20, 5)
 
 if st.button("▶ Start Extraction"):
-    data = scrape_auchan(url_input, count)
+    data = scrape(url_input, count)
     if not data.empty:
         st.dataframe(data)
         data.to_excel("auchan_results.xlsx", index=False)
