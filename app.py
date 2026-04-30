@@ -1,41 +1,54 @@
 import streamlit as st
 import pandas as pd
 import random
+import os
 from seleniumbase import SB
+
+# --- THE FIX FOR PERMISSION ERROR ---
+# This forces SeleniumBase to use the /tmp folder which is writable on Streamlit Cloud
+os.environ["SELENIUMBASE_DRIVERS_PATH"] = "/tmp/seleniumbase/drivers"
 
 st.set_page_config(page_title="Auchan Scraper", layout="wide")
 
 def scrape_auchan(category_url, num_products):
     results = []
     
-    # We use 'uc=False' here because 'activate_cdp_mode' handles the stealth 
-    # without the need for the file-patching that causes PermissionError.
+    # We use basic selenium mode but with stealth-enhancing options
     with SB(uc=False, xvfb=True, headless=True) as sb:
         try:
-            st.info("🌐 Opening Auchan via CDP Stealth...")
+            st.info("🌐 Initializing Stealth Connection...")
+            
+            # Using CDP Mode to bypass anti-bot without needing to patch files
             sb.activate_cdp_mode(category_url)
             sb.sleep(5) 
             
-            # Find Links
+            # Scroll down to load lazy-loaded products
+            sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            sb.sleep(2)
+
+            # 1. Collect Product URLs
             elements = sb.find_elements("a[href*='/product/']")
             urls = list(set([el.get_attribute("href") for el in elements]))[:num_products]
             
             if not urls:
-                st.error("No product links found. The site structure may have changed.")
+                st.error("No product links found. Site might be blocking the IP.")
                 return pd.DataFrame()
 
             progress_bar = st.progress(0)
             for i, url in enumerate(urls):
-                st.write(f"🔍 Parsing product {i+1}...")
+                st.write(f"🔍 Parsing product {i+1} of {len(urls)}...")
                 sb.open(url)
-                sb.sleep(random.uniform(2, 4))
+                sb.sleep(random.uniform(3, 5))
                 
                 try:
-                    # Extraction logic (Updated selectors)
+                    # Extraction Logic - targeting Auchan's specific layout
                     name = sb.get_text("h1")
-                    brand = sb.get_text(".product-brand-name") if sb.is_element_visible(".product-brand-name") else "N/A"
-                    # Manufacturer/Description often in this div
-                    details = sb.get_text(".product-description") if sb.is_element_visible(".product-description") else "N/A"
+                    
+                    # Brand/Sub-brand often found in breadcrumbs or specific spans
+                    brand = sb.get_text("span[itemprop='brand']") if sb.is_element_visible("span[itemprop='brand']") else "N/A"
+                    
+                    # Manufacturer info/Description
+                    details = sb.get_text("#product-description") if sb.is_element_visible("#product-description") else "N/A"
                     
                     results.append({
                         "Name": name,
@@ -43,25 +56,31 @@ def scrape_auchan(category_url, num_products):
                         "Information": details,
                         "URL": url
                     })
-                except:
+                except Exception as e:
+                    st.warning(f"Skipped {url}: Data not found.")
                     continue
                     
                 progress_bar.progress((i + 1) / len(urls))
                 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Critical Error: {e}")
             
     return pd.DataFrame(results)
 
-st.title("Auchan Poland Vacuum")
-url_input = st.text_input("Auchan Category Link", "https://zakupy.auchan.pl/categories/higiena-i-kosmetyki/piel%C4%99gnacja-w%C5%82os%C3%B3w/3939")
-count = st.number_input("Items to scrape", 1, 20, 5)
+# --- Streamlit UI ---
+st.title("🛒 Auchan PL - Data Vacuum")
+st.markdown("This tool bypasses read-only restrictions and anti-bot headers.")
 
-if st.button("Start Scraper"):
+url_input = st.text_input("Category URL", "https://zakupy.auchan.pl/categories/higiena-i-kosmetyki/piel%C4%99gnacja-w%C5%82os%C3%B3w/3939")
+count = st.number_input("Limit (items)", 1, 50, 5)
+
+if st.button("🚀 Start Extraction"):
     data = scrape_auchan(url_input, count)
     if not data.empty:
+        st.subheader("Data Preview")
         st.dataframe(data)
-        # Excel Export
-        data.to_excel("export.xlsx", index=False)
-        with open("export.xlsx", "rb") as f:
-            st.download_button("Download Excel", f, "auchan_data.xlsx")
+        
+        # Export
+        data.to_excel("auchan_export.xlsx", index=False)
+        with open("auchan_export.xlsx", "rb") as f:
+            st.download_button("📥 Download Excel File", f, "auchan_results.xlsx")
