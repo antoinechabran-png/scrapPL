@@ -1,3 +1,2 @@
-chromium
-chromium-driver
-xvfb
+# No system packages needed — Selenium/Chromium removed.
+# requests + BeautifulSoup are pure Python and work without system deps.
